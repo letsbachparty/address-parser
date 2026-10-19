@@ -1,40 +1,12 @@
 /**
- * Address parser: United States, Canada, and Mexico.
- * Existing browser global: parseAddress. CommonJS: require('./address-parser.js').
- *
- * Recommended APIs (existing names and fields are preserved):
- *   parseAddress.parseFullAddress(fullAddress, optionalCountry)
- *   parseAddress.validateFullAddress(fullAddress, optionalCountry)
- *   parseAddress.hasEnoughAddressParts(fullAddress, optionalCountry)
- * optionalCountry: 'US' / 'CA' / 'MX', or { country: 'CA' }.
- *
- * parseFullAddress returns addr1, addr2, city, state, zip, country.
- * state is a U.S. state/territory code, Canadian province/territory code,
- * or Mexican three-letter code. zip holds the postal code for all countries.
- * Canadian postal codes are uppercase with one space (K1A 0B1).
- * Mexican postal codes stay strings, preserving leading zeroes.
- * Validation checks completeness: addr1 + ((city + state) OR postal code).
- * It does not verify existence, deliverability, or postal-code/region geography.
- *
- * Country inference uses an explicit argument, a country suffix, postal format,
- * and administrative-area aliases. Bare 5-digit postal codes cannot distinguish
- * US from MX: country stays empty and countryCandidates lists both countries.
- * For shared aliases that include a U.S. state, legacy US priority is retained
- * with countryAssumed and countryCandidates. Pass the country when known.
- * Shared CA/MX aliases without postal evidence leave country/state empty.
- * Duplicate aliases within a country leave state empty and add stateCandidates.
- * Postal-only completeness may still be true when the state is ambiguous.
- * A conflicting explicit country, area or postal format makes validation false.
- *
- * International parsing preserves accents, accepts comma/newline-separated
- * addresses, Canadian unit-civic numbers, Mexican street-name-first numbers,
- * and Mexican postal codes before the locality. Neighborhood/extra lines are
- * retained in addr2. With a missing separator and no recognizable street end,
- * a free-form street/city boundary is left unsplit rather than invented.
- *
- * Administrative-area aliases: supplied Canada/Mexico workbook, plus common
- * French/Spanish names. Postal patterns: supplied patterns (US parenthesis
- * typo corrected; existing contiguous ZIP+4 support retained).
+ * U.S./Canada/Mexico address completeness parser. No country is inferred,
+ * required, accepted as a routing hint, or returned. Existing extra arguments
+ * are ignored for compatibility. Required: Address 1 AND (state OR postal code).
+ * City is extracted when possible but is not required for completeness.
+ * Shared administrative aliases are accepted as written; stateCandidates lists
+ * their possible normalized codes without selecting a country or blocking input.
+ * zip accepts five digits, ZIP+4, or the supplied Canadian postal-code pattern.
+ * This is a completeness check, not delivery or geographic verification.
  */
 (function(f) {
     if (typeof exports === "object" && typeof module !== "undefined") {
@@ -960,9 +932,7 @@
                 // Public parsing and validation share the same corrected parts.
                 // Low-level parseLocation remains available for raw parser data.
                 parser.parseFullAddress = analyzeFullAddress;
-                // North American extension. Administrative-area aliases come from
-                // the supplied workbook. A country hint may be 'US', 'CA', 'MX',
-                // or { country: 'CA' } / { countryCode: 'CA' }.
+                // Combined administrative-area aliases from the supplied workbook.
                 const INTERNATIONAL_AREAS = {
     "MX": [
         [
@@ -1376,166 +1346,69 @@
         ]
     ]
 };
-                const POSTAL_PATTERNS = Object.freeze({
-                    CA: /^[ABCEGHJKLMNPRSTVXY]\d[ABCEGHJ-NPRSTV-Z] ?\d[ABCEGHJ-NPRSTV-Z]\d$/i,
-                    // Corrects the literal-parenthesis typo in the supplied US
-                    // pattern. Contiguous ZIP+4 remains supported for compatibility.
-                    US: /^\d{5}(?:[ -]?\d{4})?$/,
-                    MX: /^\d{5}$/
-                });
-                const AREA_INDEX = { US: new Map(), CA: new Map(), MX: new Map() };
+                const AREAS = new Map();
                 function foldArea(value) {
                     return addressPart(value).normalize('NFD').replace(/\p{M}/gu, '')
                         .toLowerCase().replace(/\./g, '').replace(/\s+/g, ' ');
                 }
-                function addArea(country, code, name, aliases) {
-                    for (const alias of [name, code].concat(aliases || [])) {
-                        const key = foldArea(alias);
-                        const existing = AREA_INDEX[country].get(key) || [];
-                        if (!existing.some(item => item.code === code)) existing.push({ code, name });
-                        AREA_INDEX[country].set(key, existing);
+                function addArea(code, name, aliases = []) {
+                    for (const alias of [name, code, ...aliases]) {
+                        const key = foldArea(alias), matches = AREAS.get(key) || [];
+                        if (!matches.some(item => item.code === code)) matches.push({code, name});
+                        AREAS.set(key, matches);
                     }
                 }
-                Object.keys(State_Code).forEach(name => addArea('US', State_Code[name], name));
-                ['CA', 'MX'].forEach(country => INTERNATIONAL_AREAS[country].forEach(row =>
-                    addArea(country, row[0], row[1], row[2])));
-                // Common local-language names supplement (rather than replace)
-                // every alias from the workbook.
-                addArea('CA', 'QC', 'Québec');
-                addArea('CA', 'NB', 'Nouveau-Brunswick');
-                addArea('CA', 'NS', 'Nouvelle-Écosse');
-                addArea('CA', 'BC', 'Colombie-Britannique');
-                addArea('CA', 'NL', 'Terre-Neuve-et-Labrador');
-                addArea('CA', 'NT', 'Territoires du Nord-Ouest');
-                addArea('CA', 'PE', 'Île-du-Prince-Édouard');
-                addArea('MX', 'CMX', 'Ciudad de México', ['Distrito Federal']);
-                addArea('MX', 'MEX', 'Estado de México');
-                addArea('MX', 'COA', 'Coahuila de Zaragoza');
-                addArea('MX', 'MIC', 'Michoacán de Ocampo');
-                addArea('MX', 'VER', 'Veracruz de Ignacio de la Llave');
-
-                const legacyAnalyzeUS = analyzeFullAddress;
-                const legacyMethods = {};
-                ['parseAddress', 'parseInformalAddress', 'parsePoAddress', 'parseLocation', 'parseIntersection']
-                    .forEach(name => { legacyMethods[name] = parser[name]; });
-                // Never route legacy internals back through country inference.
-                // This also keeps existing U.S. parsing fast and deterministic.
-                let insideLegacyUS = false;
-                function runLegacy(fn, input) {
-                    const previous = insideLegacyUS;
-                    insideLegacyUS = true;
-                    try { return fn(input); } finally { insideLegacyUS = previous; }
-                }
-                function countryOption(options) {
-                    const value = typeof options === 'string' ? options :
-                        options && (options.country || options.countryCode || options.regionCode);
-                    if (!value) return '';
-                    const key = foldArea(value);
-                    const names = { us: 'US', usa: 'US', 'united states': 'US',
-                        'united states of america': 'US', ca: 'CA', can: 'CA', canada: 'CA',
-                        mx: 'MX', mex: 'MX', mexico: 'MX', 'estados unidos mexicanos': 'MX' };
-                    if (!Object.prototype.hasOwnProperty.call(names, key)) {
-                        throw new RangeError('Unsupported country. Use US, CA, or MX.');
-                    }
-                    return names[key];
-                }
+                Object.entries(State_Code).forEach(([name, code]) => addArea(code, name));
+                Object.values(INTERNATIONAL_AREAS).forEach(rows => rows.forEach(row => addArea(row[0], row[1], row[2])));
+                addArea('QC', 'Québec');
+                addArea('CMX', 'Ciudad de México', ['Distrito Federal']);
+                addArea('MEX', 'Estado de México');
+                addArea('COA', 'Coahuila de Zaragoza');
+                addArea('MIC', 'Michoacán de Ocampo');
+                addArea('VER', 'Veracruz de Ignacio de la Llave');
                 function cleanEdge(value) { return value.replace(/^[\s,]+|[\s,]+$/g, ''); }
-                function findArea(text, country) {
+                function findArea(text) {
                     const tokens = [...text.matchAll(/[\p{L}\p{N}.'’\-]+/gu)];
-                    // Longest suffix first, preserving original character indices.
                     for (let i = Math.max(0, tokens.length - 7); i < tokens.length; i++) {
-                        const start = tokens[i].index;
-                        const token = cleanEdge(text.slice(start));
-                        const matches = AREA_INDEX[country].get(foldArea(token));
-                        if (matches) return { start, token, matches };
+                        const start = tokens[i].index, token = cleanEdge(text.slice(start));
+                        const matches = AREAS.get(foldArea(token));
+                        if (matches) return {start, token, matches};
                     }
                     return null;
                 }
-                function stripCountry(input, hint) {
-                    const match = /(?:^|[\s,])((?:United States(?: of America)?|U\.?S\.?A?\.?|Canada|CAN|CA|Estados Unidos Mexicanos|M[eé]xico|MEX|MX))\s*$/i.exec(input);
-                    if (!match) return { text: input, country: '' };
-                    const country = countryOption(match[1]);
-                    const before = cleanEdge(input.slice(0, match.index));
-                    // 'México' and MEX/MX may be the state, and CA may be
-                    // California. Strip these only with independent evidence.
-                    const ambiguousMX = /^(?:m[eé]xico|mex|mx)$/i.test(match[1]);
-                    const ambiguousCA = /^ca$/i.test(match[1]);
-                    const numericPostal = /(?:^|[\s,])\d{5}(?:[ -]?\d{4})?$/.test(before);
-                    if (ambiguousMX && !numericPostal && !findArea(before, 'MX')) {
-                        return { text: input, country: '' };
-                    }
-                    if (ambiguousCA && !takePostal(before, 'CA').zip &&
-                        !findArea(before, 'CA') && hint !== 'CA') return { text: input, country: '' };
-                    return { text: before, country };
-                }
-                function takePostal(text, country) {
-                    let match;
-                    if (country === 'CA') {
-                        match = /(?:^|[\s,])([ABCEGHJKLMNPRSTVXY]\d[ABCEGHJ-NPRSTV-Z] ?\d[ABCEGHJ-NPRSTV-Z]\d)\s*$/i.exec(text);
-                    } else if (country === 'US') {
-                        match = /(?:^|[\s,])(\d{5})(?:[ -]?(\d{4}))?\s*$/.exec(text);
-                    } else {
-                        match = /(?:^|[\s,])(?:C\.?\s*P\.?\s*)?(\d{5})\s*$/i.exec(text);
+                const POSTAL_PATTERN = /^(?:\d{5}(?:-\d{4})?|[ABCEGHJKLMNPRSTVXY]\d[ABCEGHJ-NPRSTV-Z] \d[ABCEGHJ-NPRSTV-Z]\d)$/i;
+                function takePostal(text) {
+                    let match = /(?:^|[\s,])([ABCEGHJKLMNPRSTVXY]\d[ABCEGHJ-NPRSTV-Z] ?\d[ABCEGHJ-NPRSTV-Z]\d)\s*$/i.exec(text);
+                    let zip = '';
+                    if (match) zip = match[1].toUpperCase().replace(/ /g, '').replace(/^(.{3})/, '$1 ');
+                    else {
+                        match = /(?:^|[\s,])(?:C\.?\s*P\.?\s*)?(\d{5})(?:[ -]?(\d{4}))?\s*$/i.exec(text);
                         if (!match) {
-                            // Mexican postal codes may precede the locality, or
-                            // occupy their own comma/newline-separated line.
                             const candidates = [...text.matchAll(/(?:^|[\s,])(?:C\.?\s*P\.?\s*)?(\d{5})(?=$|[\s,])/gi)];
-                            match = candidates.reverse().find(item => {
-                                const before = text.slice(0, item.index);
-                                return before.includes(',') || /C\.?\s*P\.?/i.test(item[0]);
-                            });
+                            match = candidates.reverse().find(item => text.slice(0, item.index).includes(',') || /C\.?\s*P\.?/i.test(item[0]));
                         }
+                        if (match) zip = match[1] + (match[2] ? '-' + match[2] : '');
                     }
-                    if (!match) return { text, zip: '' };
-                    const raw = match[1] + (match[2] ? '-' + match[2] : '');
-                    if (!POSTAL_PATTERNS[country].test(raw)) return { text, zip: '' };
-                    const zip = country === 'CA' ? raw.toUpperCase().replace(/\s/g, '').replace(/^(.{3})/, '$1 ') : raw;
-                    return { text: cleanEdge(text.slice(0, match.index) + text.slice(match.index + match[0].length)), zip };
+                    if (!match) return {text, zip:''};
+                    return {text:cleanEdge(text.slice(0,match.index)+text.slice(match.index+match[0].length)), zip};
                 }
-                function addressContext(value, options) {
-                    // Preserve line boundaries as delimiters before collapsing spaces.
-                    const input = addressPart(value).replace(/\r?\n|\r/g, ', ').replace(/\s+/g, ' ');
-                    const hint = countryOption(options);
-                    const suffix = stripCountry(input, hint);
-                    const views = {};
-                    ['US', 'CA', 'MX'].forEach(country => {
-                        let postal = takePostal(suffix.text, country);
-                        let area = findArea(postal.text, country);
-                        // Also accept 'city, postal code, state'.
-                        if (area && !postal.zip) {
-                            const beforeArea = cleanEdge(postal.text.slice(0, area.start));
-                            const earlierPostal = takePostal(beforeArea, country);
-                            if (earlierPostal.zip) {
-                                postal = { text: cleanEdge(earlierPostal.text + ', ' + area.token), zip: earlierPostal.zip };
-                                area = findArea(postal.text, country);
-                            }
-                        }
-                        views[country] = { postal, area };
-                    });
-                    let country = hint || suffix.country;
-                    let candidates = [];
-                    if (!country) {
-                        if (views.CA.postal.zip) country = 'CA';
-                        else {
-                            candidates = ['US', 'CA', 'MX'].filter(code => views[code].area);
-                            // A numeric postal code rules out Canada for aliases
-                            // such as BC. U.S. canonical states retain legacy priority.
-                            if (views.US.postal.zip || views.MX.postal.zip) candidates = candidates.filter(code => code !== 'CA');
-                            if (candidates.length === 1) country = candidates[0];
-                            else if (candidates.includes('US')) country = 'US';
-                            else if (!candidates.length && views.US.postal.zip.includes('-')) country = 'US';
+                function neutralContext(value) {
+                    let text = addressPart(value).replace(/\r?\n|\r/g, ', ').replace(/\s+/g, ' ');
+                    // Ignore an optional trailing label without assigning a country.
+                    const label = /(?:^|[\s,])(?:Canada|USA?|United States(?: of America)?|Estados Unidos Mexicanos|M[eé]xico)\s*$/i.exec(text);
+                    if (label) {
+                        const before = cleanEdge(text.slice(0, label.index));
+                        if (takePostal(before).zip || findArea(before) || !/m[eé]xico/i.test(label[0])) text = before;
+                    }
+                    let postal = takePostal(text), area = findArea(postal.text);
+                    if (area && !postal.zip) {
+                        const earlier = takePostal(cleanEdge(postal.text.slice(0,area.start)));
+                        if (earlier.zip) {
+                            postal = {text:cleanEdge(earlier.text+', '+area.token),zip:earlier.zip};
+                            area = findArea(postal.text);
                         }
                     }
-                    const numericOnly = !country && !candidates.length && views.US.postal.zip;
-                    if (numericOnly) candidates = ['US', 'MX'];
-                    const selected = country || (candidates.length ? candidates[0] : 'US');
-                    const view = views[selected];
-                    let conflict = Boolean(hint && suffix.country && hint !== suffix.country);
-                    if (country && country !== 'CA' && views.CA.postal.zip) conflict = true;
-                    if (country === 'CA' && (views.US.postal.zip || views.MX.postal.zip)) conflict = true;
-                    const otherAreas = ['US', 'CA', 'MX'].filter(code => code !== selected && views[code].area);
-                    if (country && !view.area && otherAreas.length) conflict = true;
-                    return { input, text: suffix.text, hint, country, selected, candidates, view, conflict };
+                    return {view:{postal,area}};
                 }
                 const INTL_UNIT = /(?:^|\s)((?:apartment|appartement|apt|app|suite|ste|unit|unité|bureau|depto|departamento|dpto|interior|int|piso|local|oficina|of|floor|fl|room|rm)\.?\s*#?\s*[\p{L}\p{N}-]+)\s*$/iu;
                 const INTL_PO = /^(?:P[.\s]*O[.\s]*Box|Post\s+Office\s+Box|Postal\s+Box|Case\s+Postale|C\.?\s*P\.?|Apartado\s+Postal)\s*#?\s*[\p{L}\p{N}-]+(?:\s+.*)?$/iu;
@@ -1547,22 +1420,18 @@
                         /^(?:de|del|la|las|los|el|y|du|des|le|les|et|sur)$/i.test(word) ? word.toLowerCase() : word);
                 }
                 function internationalParts(context) {
-                    const { view, selected } = context;
+                    const { view } = context;
                     const area = view.area;
                     let remainder = area ? cleanEdge(view.postal.text.slice(0, area.start)) : view.postal.text;
-                    let state = area && area.matches.length === 1 ? area.matches[0].code : '';
+                    let state = area ? (area.matches.length === 1 ? area.matches[0].code : area.token.toUpperCase()) : '';
                     const segments = remainder.split(/\s*,\s*/).filter(Boolean);
                     let line = segments[0] || '';
                     let addr2 = '';
                     const unit = INTL_UNIT.exec(line);
                     if (unit) { addr2 = unit[1]; line = cleanEdge(line.slice(0, unit.index)); }
-                    // Canada Post's unit-civic form: 10-123 Main St.
-                    let prefixUnit = '';
-                    const unitCivic = selected === 'CA' && /^(\d+[A-Za-z]?)\s*[-–—]\s*(\d+[A-Za-z]?\s+.*)$/u.exec(line);
-                    if (unitCivic) { prefixUnit = unitCivic[1]; line = unitCivic[2]; addr2 = ['Unit ' + prefixUnit, addr2].filter(Boolean).join(', '); }
                     const streetPresent = value => INTL_PO.test(value) || NUMBERED_STREET.test(value) ||
-                        (selected === 'MX' && MX_STREET.test(value)) ||
-                        (selected === 'MX' && /^(?:calle|avenida|av|ave|avda|paseo|calzada|calz|boulevard|blvd|bulevar|carretera|carr|camino|cerrada|cda|privada|priv|andador|prolongaci[oó]n|circuito)\.?\s+.*\d/iu.test(value)) ||
+                        (MX_STREET.test(value)) ||
+                        (/^(?:calle|avenida|av|ave|avda|paseo|calzada|calz|boulevard|blvd|bulevar|carretera|carr|camino|cerrada|cda|privada|priv|andador|prolongaci[oó]n|circuito)\.?\s+.*\d/iu.test(value)) ||
                         (!UNIT_START.test(value) && STREET_SUFFIX.test(value));
                     let hasStreet = streetPresent(line);
                     let city = '';
@@ -1589,7 +1458,7 @@
                             line = line.slice(0, split.index + split[0].length).trim();
                             const cityUnit = /^((?:apt|apartment|appartement|app|suite|ste|unit|bureau|depto|departamento|dpto|interior|int|piso|local)\.?\s*#?\s*[\p{L}\p{N}-]+)\s+(.+)$/iu.exec(city);
                             if (cityUnit) { addr2 = [addr2, cityUnit[1]].filter(Boolean).join(', '); city = cityUnit[2]; }
-                        } else if (selected === 'MX') {
+                        } else {
                             const numbered = /^(.*\s(?:\d+[A-Za-z]?|s\/?n))\s+([\p{L}][\p{L} .'’\-]*)$/iu.exec(line);
                             if (numbered && MX_STREET.test(numbered[1])) { line = numbered[1]; city = numbered[2]; }
                         }
@@ -1601,96 +1470,52 @@
                     if (!city && state === 'CMX' && area && /^(?:ciudad de m[eé]xico|mexico city)$/i.test(area.token)) city = area.token;
                     const parts = { addr1: hasStreet ? intlFormat(line, 'addr1') : '',
                         addr2: hasStreet ? intlFormat(addr2, 'addr2') : '', city: intlFormat(city, 'city'),
-                        state, zip: view.postal.zip, country: context.country };
+                        state, zip: view.postal.zip };
                     if (area && area.matches.length > 1) parts.stateCandidates = area.matches.map(item => item.code);
                     return parts;
                 }
-                function parseNorthAmerican(value, options) {
-                    const context = addressContext(value, options);
-                    let parts;
-                    if (context.selected === 'US') {
-                        parts = runLegacy(legacyAnalyzeUS, context.text);
-                        parts.country = context.country;
-                    } else parts = internationalParts(context);
-                    if (context.candidates.length > 1) {
-                        parts.countryCandidates = context.candidates.slice();
-                        if (context.country) parts.countryAssumed = true;
-                        else parts.state = '';
-                    }
-                    if (context.conflict) parts.countryConflict = true;
-                    return parts;
+                function parseWithoutCountry(value) {
+                    return internationalParts(neutralContext(value));
                 }
-                parser.parseFullAddress = parseNorthAmerican;
-                parser.validateFullAddress = function(value, options) {
-                    const parts = parseNorthAmerican(value, options);
-                    const pattern = POSTAL_PATTERNS[parts.country] || POSTAL_PATTERNS.US;
-                    const detected = { address1: Boolean(parts.addr1), city: Boolean(parts.city),
-                        state: Boolean(parts.state), zip: pattern.test(parts.zip) };
-                    const valid = !parts.countryConflict && detected.address1 &&
-                        ((detected.city && detected.state) || detected.zip);
-                    let message = '';
-                    if (!valid) {
-                        const area = parts.country === 'CA' ? 'province/territory' : 'state';
-                        const postal = parts.country === 'US' ? 'zip code' : 'postal code';
-                        if (parts.countryConflict) message = 'The country, administrative area, and postal-code format conflict. Check the address or country setting.';
-                        else if (!addressPart(value)) message = 'Enter a street address and either a city and state/province or a postal code.';
-                        else if (!detected.address1) message = 'Add the street address (Address 1) or PO Box. A city, administrative area, or postal code alone is not enough.';
-                        else if (parts.stateCandidates) message = 'This administrative-area abbreviation is ambiguous. Enter its full name or a unique code, or add a valid ' + postal + '.';
-                        else if (parts.countryCandidates && !parts.country) message = 'Add the country or pass a country setting to resolve this administrative-area abbreviation.';
-                        else if (detected.city && !detected.state) message = 'Add a valid ' + area + ' or ' + postal + ' to complete this address.';
-                        else if (!detected.city && detected.state) message = 'Add a city or valid ' + postal + ' to complete this address.';
-                        else message = 'Add the city and ' + area + ', or a valid ' + postal + ', to complete this address.';
-                    }
-                    return { valid, message, parts, detected };
+                parser.parseFullAddress = parseWithoutCountry;
+                parser.validateFullAddress = function(value) {
+                    const parts = parseWithoutCountry(value);
+                    const detected = {address1:Boolean(parts.addr1), city:Boolean(parts.city),
+                        state:Boolean(parts.state), zip:POSTAL_PATTERN.test(parts.zip)};
+                    const valid = detected.address1 && (detected.state || detected.zip);
+                    const message = valid ? '' : !addressPart(value)
+                        ? 'Enter a street address and a state/province/territory or postal code.'
+                        : !detected.address1
+                        ? 'Add the street address (Address 1) or PO Box.'
+                        : 'Add a recognized state/province/territory or a valid postal code.';
+                    return {valid,message,parts,detected};
                 };
-                parser.hasEnoughAddressParts = function(value, options) {
-                    return parser.validateFullAddress(value, options).valid;
+                parser.hasEnoughAddressParts = function(value) {
+                    return parser.validateFullAddress(value).valid;
                 };
-                // Keep the raw API available to existing callers. International
-                // results also include addr1/addr2 so Mexican number order is retained.
-                Object.keys(legacyMethods).forEach(name => {
-                    parser[name] = function(value, options) {
-                        if (insideLegacyUS) return legacyMethods[name](value);
-                        const context = addressContext(value, options);
-                        if (context.selected === 'US' && !context.conflict) {
-                            return runLegacy(legacyMethods[name], context.text);
-                        }
-                        if (!context.input) return null;
-                        const parts = parseNorthAmerican(value, options);
+                ['parseLocation','parseAddress','parseInformalAddress','parsePoAddress'].forEach(name => {
+                    parser[name] = function(value) {
+                        if (!addressPart(value)) return null;
+                        const parts = parseWithoutCountry(value);
                         if (name === 'parseAddress' && !parts.addr1) return null;
                         if (name === 'parsePoAddress' && !INTL_PO.test(parts.addr1)) return null;
-                        if (name === 'parseIntersection' && !/(?:\s(?:and|et|y)\s|\s[&@]\s)/i.test(parts.addr1)) return null;
-                        const raw = { city: parts.city, state: parts.state, zip: parts.zip,
-                            country: parts.country, addr1: parts.addr1, addr2: parts.addr2 };
+                        const raw = {...parts};
                         const number = /^(\d+[A-Za-z]?(?:[-–—]\d+[A-Za-z]?)?)(?:\s+(\d+\/\d+))?\s+(.*)$/u.exec(parts.addr1);
-                        const trailingNumber = context.selected === 'MX' && /^(.*?)\s+(?:(?:n[uú]m(?:ero)?|no)\.?\s*|#\s*)?(\d+[A-Za-z]?(?:[-/]\d+)?|s\/?n)$/iu.exec(parts.addr1);
+                        const trailing = /^(.*?)\s+(?:(?:n[uú]m(?:ero)?|no)\.?\s*|#\s*)?(\d+[A-Za-z]?(?:[-/]\d+)?|s\/?n)$/iu.exec(parts.addr1);
                         const box = /^(.*?(?:box|postale|postal|C\.?\s*P\.?))\s*#?\s*([\p{L}\p{N}-]+)$/iu.exec(parts.addr1);
-                        if (INTL_PO.test(parts.addr1) && box) {
-                            raw.sec_unit_type = box[1]; raw.sec_unit_num = box[2];
-                        } else if (number) {
-                            raw.number = number[1]; raw.street = number[3];
-                            if (number[2]) raw.fraction = number[2];
-                        } else if (trailingNumber) { raw.street = trailingNumber[1]; raw.number = trailingNumber[2]; }
-                        else if (parts.addr1) raw.street = parts.addr1;
+                        if (box && INTL_PO.test(parts.addr1)) {raw.sec_unit_type=box[1];raw.sec_unit_num=box[2];}
+                        else if (number) {raw.number=number[1];raw.street=number[3];if(number[2])raw.fraction=number[2];}
+                        else if (trailing) {raw.number=trailing[2];raw.street=trailing[1];}
+                        else if (parts.addr1) raw.street=parts.addr1;
                         if (parts.addr2) {
-                            const secondary = /^([^\d#]+?)\s*#?\s*([\p{L}\p{N}-]+)$/u.exec(parts.addr2);
-                            if (secondary && !parts.addr2.includes(',')) {
-                                raw.sec_unit_type = secondary[1].trim(); raw.sec_unit_num = secondary[2];
-                            } else raw.sec_unit_type = parts.addr2;
+                            const unit=/^([^\d#]+?)\s*#?\s*([\p{L}\p{N}-]+)$/u.exec(parts.addr2);
+                            if(unit && !parts.addr2.includes(',')){raw.sec_unit_type=unit[1].trim();raw.sec_unit_num=unit[2];}
+                            else raw.sec_unit_type=parts.addr2;
                         }
-                        if (name === 'parseIntersection') {
-                            const streets = parts.addr1.split(/\s+(?:and|et|y|[&@])\s+/i);
-                            if (streets.length !== 2) return null;
-                            raw.street1 = streets[0]; raw.street2 = streets[1];
-                            delete raw.street;
-                        }
-                        ['stateCandidates', 'countryCandidates', 'countryAssumed', 'countryConflict'].forEach(key => {
-                            if (Object.prototype.hasOwnProperty.call(parts, key)) raw[key] = parts[key];
-                        });
+                        if (/^\d{5}-\d{4}$/.test(raw.zip)) {raw.plus4=raw.zip.slice(6);raw.zip=raw.zip.slice(0,5);}
                         return raw;
                     };
                 });
-
                 if (typeof define !== "undefined" && define.amd) {
                     define([], function() {
                         return parser
